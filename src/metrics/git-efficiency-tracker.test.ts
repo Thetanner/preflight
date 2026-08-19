@@ -1,7 +1,13 @@
+import { execSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import {
   GitEfficiencyTracker,
   parseDefaultBranchFromSymbolicRef,
 } from './git-efficiency-tracker.js';
+import { gitCommandTargetDir, stripHeredocBodies } from './local-session-aggregator.js';
 import type { ToolCallRecord, ReplayTimelineEntry } from '../storage/types.js';
 
 const stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -1583,5 +1589,135 @@ describe('GitEfficiencyTracker', () => {
       const metrics = tracker.getMetrics();
       expect(metrics.riskIndicators.quickConflictResolutions).toBe(1);
     });
+  });
+});
+
+describe('gitCommandTargetDir()', () => {
+  it('falls back to the tool call cwd for a plain git command', () => {
+    expect(gitCommandTargetDir('git status --short', '/home/u/aic')).toBe('/home/u/aic');
+  });
+
+  it('prefers the -C target over cwd, so work driven from one repo at another is attributed correctly', () => {
+    expect(gitCommandTargetDir('git -C /home/u/other log --oneline -1', '/home/u/aic')).toBe(
+      '/home/u/other',
+    );
+  });
+
+  it('handles a quoted -C path containing spaces', () => {
+    expect(gitCommandTargetDir('git -C "/home/u/my repo" status', '/home/u/aic')).toBe(
+      '/home/u/my repo',
+    );
+  });
+
+  it('resolves the target of a cd && git chain', () => {
+    expect(gitCommandTargetDir('cd /home/u/worktree && git commit -m x', '/home/u/aic')).toBe(
+      '/home/u/worktree',
+    );
+  });
+
+  it('ignores -C belonging to a different command', () => {
+    expect(gitCommandTargetDir('tar -C /tmp -xf a.tar && git status', '/home/u/aic')).toBe(
+      '/home/u/aic',
+    );
+  });
+
+  it('returns null when there is no target and no cwd', () => {
+    expect(gitCommandTargetDir('git status', undefined)).toBeNull();
+  });
+
+  it('skips -c config flags preceding -C', () => {
+    expect(gitCommandTargetDir('git -c core.pager=cat -C /home/u/repo log', '/home/u/aic')).toBe(
+      '/home/u/repo',
+    );
+  });
+});
+
+describe('GitEfficiencyTracker repo attribution', () => {
+  it('tags a live git event with a repo rather than leaving it blank', () => {
+    // RepoNameResolver shells out to `git -C <dir> remote get-url origin`,
+    // so this needs a real repo with a controlled remote rather than
+    // hardcoding whatever repo/fork happens to check this test out. Clear
+    // GIT_DIR/GIT_WORK_TREE: git sets these for hook subprocesses (e.g. this
+    // suite running under husky's pre-push), and they'd otherwise redirect
+    // `git init` away from the fresh temp dir and onto the real repo.
+    const dir = mkdtempSync(join(tmpdir(), 'git-efficiency-repo-attr-'));
+    const gitEnv = { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined };
+    try {
+      execSync('git init -q', { cwd: dir, env: gitEnv });
+      execSync('git remote add origin https://github.com/acme/widgets.git', {
+        cwd: dir,
+        env: gitEnv,
+      });
+
+      const tracker = new GitEfficiencyTracker();
+      tracker.recordToolCall(
+        makeRecord({ command: 'git status --short', cwd: dir } as Partial<ToolCallRecord>),
+      );
+      const [event] = tracker.getMetrics().gitCommandTimeline;
+      expect(event).toBeDefined();
+      expect(event?.repo).toBe('acme/widgets');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('redacts credentials embedded in a git remote URL', () => {
+    const tracker = new GitEfficiencyTracker();
+    tracker.recordToolCall(
+      makeRecord({
+        command:
+          'git push https://x-access-token:ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@github.com/a/b.git',
+      } as Partial<ToolCallRecord>),
+    );
+    const [event] = tracker.getMetrics().gitCommandTimeline;
+    expect(event?.command).not.toContain('ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+  });
+});
+
+describe('stripHeredocBodies()', () => {
+  it('drops an inline script body but keeps the introducing line', () => {
+    const out = stripHeredocBodies("python3 - <<'PY'\ngit push --force\nPY\necho done");
+    expect(out).toBe("python3 - <<'PY'\necho done");
+  });
+
+  it('keeps the body of an unterminated heredoc from leaking a terminator match', () => {
+    const out = stripHeredocBodies('cat <<EOF\ngit log\n');
+    expect(out).toBe('cat <<EOF');
+  });
+
+  it('honours <<- tab-stripped terminators', () => {
+    const out = stripHeredocBodies('cat <<-EOF\n\tgit push\n\tEOF\ngit status');
+    expect(out).toBe('cat <<-EOF\ngit status');
+  });
+
+  it('leaves commands without a heredoc untouched', () => {
+    expect(stripHeredocBodies('git push origin main')).toBe('git push origin main');
+  });
+});
+
+describe('GitEfficiencyTracker heredoc misclassification', () => {
+  it('does not classify a script that merely mentions git words as a git operation', () => {
+    const tracker = new GitEfficiencyTracker();
+    tracker.recordToolCall(
+      makeRecord({
+        command:
+          "cd /tmp/x && python3 - <<'PYEOF'\ns = s.replace('git push --force', 'git log')\nPYEOF\necho ok",
+      } as Partial<ToolCallRecord>),
+    );
+    const metrics = tracker.getMetrics();
+    expect(metrics.gitCommandTimeline).toHaveLength(0);
+    expect(metrics.pushCount).toBe(0);
+    expect(metrics.forcePushes).toBe(0);
+  });
+
+  it('still classifies a real git command that carries a heredoc payload', () => {
+    const tracker = new GitEfficiencyTracker();
+    tracker.recordToolCall(
+      makeRecord({
+        command: "git commit -F- <<'MSG'\nfix: something\nMSG",
+      } as Partial<ToolCallRecord>),
+    );
+    const [event] = tracker.getMetrics().gitCommandTimeline;
+    expect(event?.type).toBe('commit');
   });
 });

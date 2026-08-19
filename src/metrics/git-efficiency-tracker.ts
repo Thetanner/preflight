@@ -1,4 +1,10 @@
-import type { ToolCallRecord, ReplayTimelineEntry } from '../storage/types.js';
+import { redactSensitive } from '../config.js';
+import type { ReplayTimelineEntry, ToolCallRecord } from '../storage/types.js';
+import {
+  gitCommandTargetDir,
+  RepoNameResolver,
+  stripHeredocBodies,
+} from './local-session-aggregator.js';
 
 /**
  * Parse `git symbolic-ref --short refs/remotes/<remoteName>/HEAD`'s stdout
@@ -118,6 +124,12 @@ export interface GitEvent {
   readonly command?: string;
   readonly success: boolean;
   readonly durationMs: number | null;
+  /** `owner/name` of the repo this event belongs to, when known. */
+  readonly repo?: string | null;
+  /** Commit subject line, for events hydrated from `git log`. */
+  readonly subject?: string | null;
+  /** Browsable URL for the commit, when the remote could be mapped. */
+  readonly url?: string | null;
 }
 
 export type GitEventType =
@@ -351,6 +363,8 @@ export class GitEfficiencyTracker {
   private commitsBehindMain: number | null = null;
   private quickConflictResolutions = 0;
   private prEvents: PrEvent[] = [];
+  private firstCommitTimestamp: number | null = null;
+  private readonly repoResolver = new RepoNameResolver();
   private repoContext: RepoContext = {
     repoName: null,
     branch: null,
@@ -380,8 +394,11 @@ export class GitEfficiencyTracker {
       this.lastBuildOrTestTimestamp = record.timestamp;
     }
 
-    const command = record.command as string | undefined;
-    if (!command) return;
+    const rawCommand = record.command as string | undefined;
+    if (!rawCommand) return;
+    // Classify on the command *minus* any inline script bodies: a heredoc that
+    // merely mentions git words is not a git operation.
+    const command = stripHeredocBodies(rawCommand);
 
     // Track GitHub CLI PR commands. Split on shell separators first so a
     // `gh` invocation chained after a `git` command (e.g. `git push && gh pr
@@ -481,7 +498,15 @@ export class GitEfficiencyTracker {
     };
   }
 
-  hydrateGitLog(commits: readonly { timestamp: number; hash: string }[]): void {
+  hydrateGitLog(
+    commits: readonly {
+      timestamp: number;
+      hash: string;
+      repo?: string | null;
+      subject?: string | null;
+      url?: string | null;
+    }[],
+  ): void {
     for (const commit of commits) {
       if (!commit.hash) continue;
       const event: GitEvent = {
@@ -490,6 +515,9 @@ export class GitEfficiencyTracker {
         command: `git commit (${commit.hash})`,
         success: true,
         durationMs: null,
+        repo: commit.repo ?? null,
+        subject: commit.subject ?? null,
+        url: commit.url ?? null,
       };
       // Only add if we don't already have this commit tracked. Against an
       // existing hydrated event (one carrying its own real hash), match by
@@ -752,9 +780,16 @@ export class GitEfficiencyTracker {
   private classifyGitCommand(command: string, record: ToolCallRecord): GitEvent {
     const base = {
       timestamp: record.timestamp,
-      command,
+      // The command is now surfaced in the dashboard's Detail column, so
+      // redact it: a git remote URL can carry an embedded access token.
+      command: redactSensitive(command),
       success: record.success,
       durationMs: record.durationMs,
+      // Live git events previously carried no repo at all, so the dashboard
+      // showed "—" for everything except commits hydrated from git log.
+      repo: this.repoResolver.resolve(
+        gitCommandTargetDir(command, record.cwd as string | undefined),
+      ),
     };
 
     const output = (record.error as string) ?? '';

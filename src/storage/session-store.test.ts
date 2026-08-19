@@ -403,6 +403,29 @@ describe('SessionStore', () => {
     expect(files[0]).toBe('2026-04-15_abc-123.json');
   });
 
+  it('does not let an empty summary clobber a recorded session', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const startTime = new Date('2026-04-15T10:00:00Z').getTime();
+    store.saveSession(makeSummary({ sessionId: 'clobber-me', startTime, toolCallCount: 12 }));
+
+    // A short-lived process that adopted the same session id via the
+    // session-by-cwd breadcrumb but saw no hook activity.
+    store.saveSession(
+      makeSummary({ sessionId: 'clobber-me', startTime, toolCallCount: 0, toolBreakdown: {} }),
+    );
+
+    expect(store.loadSession('clobber-me')!.toolCallCount).toBe(12);
+  });
+
+  it('still overwrites when the new summary has activity', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const startTime = new Date('2026-04-15T10:00:00Z').getTime();
+    store.saveSession(makeSummary({ sessionId: 'grow', startTime, toolCallCount: 3 }));
+    store.saveSession(makeSummary({ sessionId: 'grow', startTime, toolCallCount: 9 }));
+
+    expect(store.loadSession('grow')!.toolCallCount).toBe(9);
+  });
+
   it('loadSession reads and parses a saved session', () => {
     const store = new SessionStore({ storagePath: tmpDir });
     const summary = makeSummary({ sessionId: 'load-test' });
@@ -1865,7 +1888,7 @@ describe('SessionStore corruption-recovery', () => {
     }
   });
 
-  it('two saveSession calls with the same sessionId result in last-write-wins, and logs a warning on the second write', () => {
+  it('merges two saveSession calls with the same sessionId into one file, keeping the latest scalar fields', () => {
     const store = new SessionStore({ storagePath: tmpDir });
     const startTime = new Date('2026-03-01T00:00:00Z').getTime();
 
@@ -1877,14 +1900,10 @@ describe('SessionStore corruption-recovery', () => {
 
     const loaded = store.loadSession('dup-id');
     expect(loaded).not.toBeNull();
+    // Scalar identity fields still follow the later write; only recorded
+    // activity is protected from regression (see the cross-process merge
+    // tests below).
     expect(loaded!.developer).toBe('bob');
-
-    const logged = stderrSpy.mock.calls.map((call: unknown[]) => String(call[0]));
-    expect(
-      logged.some(
-        (l: string) => l.includes('"warn"') && l.includes('Overwriting existing session file'),
-      ),
-    ).toBe(true);
   });
 });
 
@@ -2385,5 +2404,232 @@ describe('qualityProxy field', () => {
       JSON.parse(raw) as Parameters<typeof deserializeFullSessionSummary>[0],
     );
     expect(roundTripped.qualityProxy).toEqual(ZERO_QUALITY_PROXY_COUNTS);
+  });
+});
+
+describe('saveSession cross-process merge', () => {
+  it('does not let a thinner writer erase a richer view of the same session', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const rich = makeSummary({
+      sessionId: 'd0f6fceb-ecc5-4610-9c62-3b2c10415137',
+      toolCallCount: 7,
+      toolBreakdown: { Bash: 7 },
+      model: 'claude-sonnet-4-6',
+      tokensInput: 292,
+      tokensOutput: 533,
+      estimatedCostUsd: 0.008871,
+      modelBreakdown: {
+        'claude-sonnet-4-6': {
+          requestCount: 1,
+          totalInputTokens: 292,
+          totalOutputTokens: 533,
+          totalCostUsd: 0.008871,
+        },
+      },
+    });
+    store.saveSession(rich);
+
+    // The MCP engine spawned by the same CLI session writes its own partial
+    // view under the identical session id.
+    const thin = makeSummary({
+      sessionId: 'd0f6fceb-ecc5-4610-9c62-3b2c10415137',
+      toolCallCount: 1,
+      toolBreakdown: { Bash: 1 },
+      model: null,
+      tokensInput: 0,
+      tokensOutput: 0,
+      estimatedCostUsd: null,
+      modelBreakdown: {},
+    });
+    store.saveSession(thin);
+
+    const loaded = store.loadSession('d0f6fceb-ecc5-4610-9c62-3b2c10415137');
+    expect(loaded?.toolCallCount).toBe(7);
+    expect(loaded?.model).toBe('claude-sonnet-4-6');
+    expect(loaded?.tokensInput).toBe(292);
+    expect(loaded?.modelBreakdown).toEqual({
+      'claude-sonnet-4-6': {
+        requestCount: 1,
+        totalInputTokens: 292,
+        totalOutputTokens: 533,
+        totalCostUsd: 0.008871,
+      },
+    });
+  });
+
+  it('still lets a later write add new activity', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'aaaa1111-2222-4333-8444-555566667777';
+    store.saveSession(makeSummary({ sessionId: id, toolCallCount: 2, toolBreakdown: { Bash: 2 } }));
+    store.saveSession(makeSummary({ sessionId: id, toolCallCount: 9, toolBreakdown: { Bash: 9 } }));
+    const loaded = store.loadSession(id);
+    expect(loaded?.toolCallCount).toBe(9);
+    expect(loaded?.toolBreakdown).toEqual({ Bash: 9 });
+  });
+
+  it('unions per-model breakdowns contributed by different processes', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'bbbb1111-2222-4333-8444-555566667777';
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        toolCallCount: 1,
+        modelBreakdown: {
+          'model-a': {
+            requestCount: 1,
+            totalInputTokens: 10,
+            totalOutputTokens: 5,
+            totalCostUsd: 0.1,
+          },
+        },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        toolCallCount: 1,
+        modelBreakdown: {
+          'model-b': {
+            requestCount: 2,
+            totalInputTokens: 20,
+            totalOutputTokens: 6,
+            totalCostUsd: 0.2,
+          },
+        },
+      }),
+    );
+    expect(Object.keys(store.loadSession(id)?.modelBreakdown ?? {}).sort()).toEqual([
+      'model-a',
+      'model-b',
+    ]);
+  });
+
+  it('merges into one file instead of duplicating when a later write computes an earlier date than an existing file', () => {
+    // A `--local`/synthetic-owner process rolling up a session it only
+    // started observing after a date boundary computes its own startTime
+    // from the first event *it* saw — which can be a different calendar
+    // day than a prior save for the same real session id.
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'cccc1111-2222-4333-8444-555566667777';
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        startTime: new Date('2026-03-01T10:00:00Z').getTime(),
+        toolCallCount: 5,
+        toolBreakdown: { Bash: 5 },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        startTime: new Date('2026-03-02T09:00:00Z').getTime(),
+        toolCallCount: 3,
+        toolBreakdown: { Bash: 3 },
+      }),
+    );
+
+    const files = readdirSync(join(tmpDir, 'sessions')).filter((f) => f.includes(id));
+    expect(files).toEqual(['2026-03-01_cccc1111-2222-4333-8444-555566667777.json']);
+
+    const loaded = store.loadSession(id);
+    expect(loaded?.toolCallCount).toBe(5);
+    expect(loaded?.toolBreakdown).toEqual({ Bash: 5 });
+  });
+
+  it('does not erase a real efficiencyScore/sampleCount/components/costByWorkflowRunId when a later write never seeded them', () => {
+    // Simulates a process that resolved its session id via the cwd-only
+    // fallback (rehydrateTrackersIfResumed() is skipped for that path in
+    // src/index.ts) writing an unseeded shutdown save over a checkpoint that
+    // already had a real efficiency score recorded.
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'dddd1111-2222-4333-8444-555566667777';
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        efficiencyScore: 0.82,
+        efficiencyScoreSampleCount: 5,
+        efficiencyScoreComponents: {
+          speed: 0.8,
+          correctness: 0.9,
+          autonomy: 0.7,
+          firstAttemptQuality: 0.85,
+        },
+        costByWorkflowRunId: { 'run-1': { '2026-03-01': 1.5 } },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        toolCallCount: 20,
+        efficiencyScore: null,
+        efficiencyScoreSampleCount: 0,
+        efficiencyScoreComponents: null,
+        costByWorkflowRunId: {},
+      }),
+    );
+
+    const loaded = store.loadSession(id);
+    expect(loaded?.toolCallCount).toBe(20);
+    expect(loaded?.efficiencyScore).toBe(0.82);
+    expect(loaded?.efficiencyScoreSampleCount).toBe(5);
+    expect(loaded?.efficiencyScoreComponents).toEqual({
+      speed: 0.8,
+      correctness: 0.9,
+      autonomy: 0.7,
+      firstAttemptQuality: 0.85,
+    });
+    expect(loaded?.costByWorkflowRunId).toEqual({ 'run-1': { '2026-03-01': 1.5 } });
+  });
+
+  it('merges the efficiencyScore/sampleCount/components triple atomically when BOTH sides have a real score', () => {
+    // sampleCount is a weight multiplier for EfficiencyScorer.seedFromPersisted()
+    // (score * sampleCount), not just a display field — taking the score from
+    // one side and the (larger) sampleCount from the other would attach a
+    // thin sample's score to a much larger weight, corrupting every future
+    // re-seed. The larger-sampleCount side's full triple must win together.
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'eeee1111-2222-4333-8444-555566667777';
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        efficiencyScore: 0.8,
+        efficiencyScoreSampleCount: 50,
+        efficiencyScoreComponents: {
+          speed: 0.8,
+          correctness: 0.8,
+          autonomy: 0.8,
+          firstAttemptQuality: 0.8,
+        },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        toolCallCount: 20,
+        efficiencyScore: 0.4,
+        efficiencyScoreSampleCount: 3,
+        efficiencyScoreComponents: {
+          speed: 0.4,
+          correctness: 0.4,
+          autonomy: 0.4,
+          firstAttemptQuality: 0.4,
+        },
+      }),
+    );
+
+    const loaded = store.loadSession(id);
+    // The 50-sample side wins outright — score AND sampleCount AND
+    // components together — not a mix of the two sides' fields.
+    expect(loaded?.efficiencyScore).toBe(0.8);
+    expect(loaded?.efficiencyScoreSampleCount).toBe(50);
+    expect(loaded?.efficiencyScoreComponents).toEqual({
+      speed: 0.8,
+      correctness: 0.8,
+      autonomy: 0.8,
+      firstAttemptQuality: 0.8,
+    });
   });
 });

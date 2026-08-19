@@ -320,6 +320,7 @@ interface HookInput {
   tool_name?: string;
   tool_input?: unknown;
   tool_response?: unknown;
+  tool_result?: unknown;
   tool_use_id?: string;
   session_id?: string;
   cwd?: string;
@@ -370,8 +371,11 @@ function extractInputMeta(toolName: string, input: unknown): Record<string, unkn
   const obj = input as Record<string, unknown>;
   const meta: Record<string, unknown> = {};
 
-  // Common field: file_path (Read, Write, Edit)
+  // Common field: file_path (Read, Write, Edit). VS Code Copilot hooks send
+  // camelCase tool_input keys (filePath) per the hooks FAQ
+  // (https://code.visualstudio.com/docs/copilot/customization/hooks).
   if (typeof obj.file_path === 'string') meta.file_path = obj.file_path;
+  else if (typeof obj.filePath === 'string') meta.file_path = obj.filePath;
 
   switch (toolName) {
     case 'Read':
@@ -379,10 +383,36 @@ function extractInputMeta(toolName: string, input: unknown): Record<string, unkn
       if (typeof obj.limit === 'number') meta.limit = obj.limit;
       break;
     case 'Write':
+    case 'create_file': // VS Code Copilot — same `content` field shape
       if (typeof obj.content === 'string') {
         meta.contentLength = obj.content.length;
         meta.lineCount = obj.content.length > 0 ? countLines(obj.content) : 0;
       }
+      break;
+    // VS Code Copilot's find-and-replace edit tools. Field names are camelCase
+    // (oldString/newString) per the hooks FAQ; tool names from toolNames.ts in
+    // microsoft/vscode (extensions/copilot/src/extension/tools/common/).
+    case 'replace_string_in_file': {
+      const oldStr = obj.oldString;
+      const newStr = obj.newString;
+      if (typeof oldStr === 'string') {
+        meta.oldStringLength = oldStr.length;
+        meta.oldLineCount = oldStr.length > 0 ? countLines(oldStr) : 0;
+      }
+      if (typeof newStr === 'string') {
+        meta.newStringLength = newStr.length;
+        meta.newLineCount = newStr.length > 0 ? countLines(newStr) : 0;
+        meta.isDelete = newStr.length === 0;
+      }
+      break;
+    }
+    case 'multi_replace_string_in_file':
+      if (Array.isArray(obj.replacements)) meta.replacementsCount = obj.replacements.length;
+      break;
+    case 'run_in_terminal':
+      if (typeof obj.command === 'string') meta.command = redact(obj.command);
+      if (typeof obj.explanation === 'string') meta.description = redact(obj.explanation);
+      if (typeof obj.isBackground === 'boolean') meta.run_in_background = obj.isBackground;
       break;
     case 'Edit':
       if (typeof obj.old_string === 'string') {
@@ -626,16 +656,31 @@ function processHook(raw: string): void {
     // — a no-match edit is a genuine failure worth surfacing to
     // anti-pattern/task-completion metrics, not a behavior to special-case
     // away.
-    const toolResponse = data.tool_response;
-    const responseSuccess =
+    // GitHub Copilot CLI sends the tool's result under `tool_result`, not
+    // `tool_response`, and signals outcome with `result_type: 'success' |
+    // 'failure'` rather than a `success` boolean (confirmed against the CLI's
+    // own runtime, which serializes `toolResult`/`resultType`/
+    // `text_result_for_llm` and fires a matching `postToolUseFailure` event).
+    // Without this alias every Copilot CLI tool call recorded outputSize 0,
+    // no output metadata, and success: true unconditionally.
+    const toolResponse = data.tool_response ?? data.tool_result;
+    const responseObj =
       toolResponse !== null && typeof toolResponse === 'object' && !Array.isArray(toolResponse)
-        ? (toolResponse as Record<string, unknown>).success
+        ? (toolResponse as Record<string, unknown>)
         : undefined;
+    const responseSuccess =
+      responseObj === undefined
+        ? undefined
+        : responseObj.success !== undefined
+          ? responseObj.success
+          : responseObj.result_type !== undefined
+            ? responseObj.result_type !== 'failure'
+            : undefined;
     event = {
       mode: 'post' as const,
       tool: toolName,
       timestamp,
-      outputSize: sizeOf(data.tool_response),
+      outputSize: sizeOf(toolResponse),
       success: typeof responseSuccess === 'boolean' ? responseSuccess : true,
     };
 
@@ -644,14 +689,12 @@ function processHook(raw: string): void {
     if (postInputMeta !== undefined) event.toolInput = postInputMeta;
 
     // Store only the metadata fields needed for tool-specific parsing
-    const outputMeta = extractOutputMeta(toolName, data.tool_response);
+    const outputMeta = extractOutputMeta(toolName, toolResponse);
     if (outputMeta !== undefined) event.toolOutput = outputMeta;
 
-    if (recordContent && data.tool_response !== undefined) {
+    if (recordContent && toolResponse !== undefined) {
       const content =
-        typeof data.tool_response === 'string'
-          ? data.tool_response
-          : JSON.stringify(data.tool_response);
+        typeof toolResponse === 'string' ? toolResponse : JSON.stringify(toolResponse);
       event.outputContent = redact(truncate(content, maxContentLen));
     }
   } else if (eventName === 'posttoolusefailure') {
@@ -1051,9 +1094,18 @@ export const _stdinFs = {
  * Code runs on a Windows host and spawns this script inside WSL via
  * `wsl.exe`: the piped stdin crossing that boundary is created by WSL's
  * root-owned init/relay (root:root, mode 0600), so re-opening `/dev/stdin`
- * fails with EACCES for the non-root user even though fd 0 is readable. Fall
- * back to the fd only on that specific error so the common case keeps
- * avoiding the EAGAIN risk above.
+ * fails with EACCES for the non-root user even though fd 0 is readable.
+ *
+ * A second case where the path fails but the fd works: when the spawning
+ * process is itself Node/Electron (VS Code's Copilot Chat runs hooks this
+ * way), libuv backs a `stdio: 'pipe'` child with a *socketpair* rather than
+ * a FIFO. `open()` on a unix socket via /proc/self/fd fails with ENXIO, so
+ * `/dev/stdin` is unusable there even though fd 0 reads fine.
+ *
+ * Rather than enumerate errnos, fall back to the fd on any /dev/stdin
+ * failure — the fd read is the more universally correct source, and the path
+ * is only preferred to dodge the EAGAIN risk noted above. If the fallback
+ * fails too, that error propagates.
  */
 function readStdinSync(): string {
   if (process.platform === 'win32') {
@@ -1061,11 +1113,8 @@ function readStdinSync(): string {
   }
   try {
     return _stdinFs.readFileSync('/dev/stdin');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'EACCES') {
-      return _stdinFs.readFileSync(process.stdin.fd);
-    }
-    throw err;
+  } catch {
+    return _stdinFs.readFileSync(process.stdin.fd);
   }
 }
 
